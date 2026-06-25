@@ -55,6 +55,9 @@ type
     procedure LoadUserIdentity;
   public
     constructor Open(const WorkspacePath: string);
+    constructor Init(const WorkspacePath: string);
+    constructor Clone(const URL, LocalPath, Username, Token: string; LogOutput: TStrings);
+
     destructor Destroy; override;
 
     function GetActiveBranchName: string;
@@ -127,6 +130,40 @@ begin
   Result := 0; // 0 tells libgit2 to continue reading the directory tree
 end;
 
+// Internal function matching libgit2's network transfer progress signature
+function InternalTransferProgressCallback(stats: Pgit_indexer_progress; payload: Pointer): Integer; cdecl;
+var
+  UnifiedPackage: PUnifiedNetworkPayload;
+  LogStrings: TStrings;
+  LogMessage: string;
+  Percent: Double;
+begin
+  UnifiedPackage := PUnifiedNetworkPayload(payload);
+  if not Assigned(UnifiedPackage) or not Assigned(UnifiedPackage^.LogOutput) then Exit(0);
+
+  LogStrings := UnifiedPackage^.LogOutput;
+  Percent := 0.0;
+
+  // 1. Calculate the real-time completion percentage metrics
+  if stats^.total_objects > 0 then
+    Percent := (stats^.received_objects / stats^.total_objects) * 100.0;
+
+  // 2. Format a highly professional terminal console logging string string
+  LogMessage := Format('📡 Downloading objects: %d/%d (%d%%) | %d bytes received',
+    [stats^.received_objects, stats^.total_objects, Trunc(Percent), stats^.received_bytes]);
+
+  // Overwrite the last line in the ListBox so it updates smoothly without creating 10,000 lines of scrolling clutter
+  if (LogStrings.Count > 0) and (Pos('📡 Downloading', LogStrings[LogStrings.Count - 1]) = 1) then
+    LogStrings[LogStrings.Count - 1] := LogMessage
+  else
+    LogStrings.Add(LogMessage);
+
+  // Force a native system thread context refresh switch so the UI paints the progress instantly
+  CheckSynchronize(0);
+  Result := 0;
+end;
+
+
 { TGitRepository }
 
 procedure TGitRepository.CheckError(const ApiResult: Integer);
@@ -195,6 +232,67 @@ begin
   // 4. Load the user credentials into the object fields immediately upon opening!
   LoadUserIdentity;
 end;
+
+constructor TGitRepository.Init(const WorkspacePath: string);
+var
+  LocalPathAnsi: AnsiString;
+begin
+  inherited Create;
+  FHandle := nil;
+  FIsInitialized := False;
+
+  CheckError(git_libgit2_init());
+  FIsInitialized := True;
+
+  LocalPathAnsi := AnsiString(WorkspacePath);
+  // Initializes the directory structure and assigns
+  // the live pointer directly to FHandle. The repository object is now ALIVE.
+  CheckError(git_repository_init(@FHandle, PAnsiChar(LocalPathAnsi), 0));
+  LoadUserIdentity;
+end;
+
+constructor TGitRepository.Clone(const URL, LocalPath, Username, Token: string; LogOutput: TStrings);
+var
+  CloneOpts: git_clone_options;
+  LocalURL, LocalPathStr: AnsiString;
+  NetworkPackage: TUnifiedNetworkPayload;
+  LocalAnsiUser, LocalAnsiToken: AnsiString;
+begin
+  inherited Create;
+  FHandle := nil;
+  FIsInitialized := False;
+
+  CheckError(git_libgit2_init());
+  FIsInitialized := True;
+
+  LocalURL := AnsiString(URL);
+  LocalPathStr := AnsiString(LocalPath);
+
+  CheckError(git_clone_options_init(@CloneOpts, 1));
+
+  LocalAnsiUser := AnsiString(Username);
+  if LocalAnsiUser = '' then LocalAnsiUser := 'git';
+  LocalAnsiToken := AnsiString(Token);
+
+  NetworkPackage.AuthData.username := PAnsiChar(LocalAnsiUser);
+  NetworkPackage.AuthData.password := PAnsiChar(LocalAnsiToken);
+  NetworkPackage.LogOutput := LogOutput;
+
+  CloneOpts.fetch_opts.callbacks.credentials := @git_credential_userpass;
+  CloneOpts.fetch_opts.callbacks.transfer_progress := @InternalTransferProgressCallback;
+  CloneOpts.fetch_opts.callbacks.payload := @NetworkPackage;
+
+  if Assigned(LogOutput) then
+    LogOutput.Add('📡 Initializing secure object download mapping for clone target: ' + URL);
+
+  // Downloads the cloud objects and assigns the live pointer directly to FHandle!
+  CheckError(git_clone(@FHandle, PAnsiChar(LocalURL), PAnsiChar(LocalPathStr), @CloneOpts));
+
+  // Cache the token to the instance field for future push/pull operations
+  FGitToken := Token;
+  LoadUserIdentity;
+end;
+
 
 destructor TGitRepository.Destroy;
 begin
@@ -273,6 +371,11 @@ begin
   SetLength(HistoryList, 0);
   Walker := nil;
 
+  // THE NEWBORN SHIELD: If the repository has zero commits, head is unborn.
+  // We exit gracefully with our empty array rather than letting the walker throw a crash!
+  if git_repository_head_unborn(FHandle) = 1 then
+    Exit;
+
   if git_revwalk_new(@Walker, FHandle) = 0 then
   begin
     try
@@ -297,7 +400,7 @@ begin
             AuthorSig := git_commit_author(CommitObj);
             if Assigned(AuthorSig) then
             begin
-              // 👈 FIXED: Mapping directly to the 'name_' and 'email' fields found in signature.inc!
+              // Mapping directly to the 'name_' and 'email' fields found in signature.inc!
               HistoryList[Count - 1].Author := string(AuthorSig^.name_);
               HistoryList[Count - 1].Email := string(AuthorSig^.email);
               HistoryList[Count - 1].Timestamp := UnixToDateTime(AuthorSig^.when.time);
@@ -628,39 +731,6 @@ begin
 
   if Result.Count = 0 then
     Result.Add('origin');
-end;
-
-// Internal function matching libgit2's network transfer progress signature
-function InternalTransferProgressCallback(stats: Pgit_indexer_progress; payload: Pointer): Integer; cdecl;
-var
-  UnifiedPackage: PUnifiedNetworkPayload;
-  LogStrings: TStrings;
-  LogMessage: string;
-  Percent: Double;
-begin
-  UnifiedPackage := PUnifiedNetworkPayload(payload);
-  if not Assigned(UnifiedPackage) or not Assigned(UnifiedPackage^.LogOutput) then Exit(0);
-
-  LogStrings := UnifiedPackage^.LogOutput;
-  Percent := 0.0;
-
-  // 1. Calculate the real-time completion percentage metrics
-  if stats^.total_objects > 0 then
-    Percent := (stats^.received_objects / stats^.total_objects) * 100.0;
-
-  // 2. Format a highly professional terminal console logging string string
-  LogMessage := Format('📡 Downloading objects: %d/%d (%d%%) | %d bytes received',
-    [stats^.received_objects, stats^.total_objects, Trunc(Percent), stats^.received_bytes]);
-
-  // Overwrite the last line in the ListBox so it updates smoothly without creating 10,000 lines of scrolling clutter
-  if (LogStrings.Count > 0) and (Pos('📡 Downloading', LogStrings[LogStrings.Count - 1]) = 1) then
-    LogStrings[LogStrings.Count - 1] := LogMessage
-  else
-    LogStrings.Add(LogMessage);
-
-  // Force a native system thread context refresh switch so the UI paints the progress instantly
-  CheckSynchronize(0);
-  Result := 0;
 end;
 
 procedure TGitRepository.Fetch(const RemoteName: string; LogOutput: TStrings);

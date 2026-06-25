@@ -31,6 +31,7 @@ type
     BtnRebaseAbort: TButton;
     BtnPush: TButton;
     BtnPull: TButton;
+    BtnClone: TButton;
     ComboBranches: TComboBox;
     ComboRemotes: TComboBox;
     EditUserName: TEdit;
@@ -51,6 +52,7 @@ type
     TabSheet1: TTabSheet;
     TabSheet2: TTabSheet;
     TabSheet3: TTabSheet;
+    procedure BtnCloneClick(Sender: TObject);
     procedure BtnCommitClick(Sender: TObject);
     procedure BtnDeleteBranchClick(Sender: TObject);
     procedure BtnDiscardChangesClick(Sender: TObject);
@@ -78,6 +80,7 @@ type
       var Special: boolean; var FG, BG: TColor);
   private
     FSessionToken: string; // Stores the Personal Access Token in RAM for this session
+    procedure RefreshUIFromRepo(Repo: TGitRepository);
   public
   end;
 
@@ -269,6 +272,55 @@ begin
       ShowMessage('❌ Commit Failed: ' + E.Message);
   end;
 end;
+
+procedure TForm1.BtnCloneClick(Sender: TObject);
+var
+  RemoteURL, LocalFolder, TargetToken, TargetUser: string;
+  Repo: TGitRepository;
+begin
+  RemoteURL := InputBox('Clone Remote Repository', 'Enter the remote HTTPS repository URL:', '');
+  RemoteURL := Trim(RemoteURL);
+  if RemoteURL = '' then Exit;
+
+  if not SelectDirectoryDialog1.Execute then Exit;
+  LocalFolder := SelectDirectoryDialog1.FileName;
+  TargetUser := EditUserName.Text;
+
+  if FSessionToken = '' then
+  begin
+    if MessageDlg('Authentication', 'Does this repository require private access authentication?', mtConfirmation, [mbYes, mbNo], 0) = mrYes then
+    begin
+      TargetToken := InputBox('Authentication Required', 'Enter your Personal Access Token (PAT):', '');
+      FSessionToken := Trim(TargetToken);
+    end;
+  end;
+  TargetToken := FSessionToken;
+
+  ListBoxNetworkLog.Items.Clear;
+  PageControlWorkspace.ActivePage := TabSheet3;
+  StatusBar1.SimpleText := '📥 Cloning remote repository... Please wait...';
+  Application.ProcessMessages;
+
+  try
+    // Downloads data packets and directly births your active, running object instance!
+    Repo := TGitRepository.Clone(RemoteURL, LocalFolder, TargetUser, TargetToken, ListBoxNetworkLog.Items);
+    try
+      EditRepoPath.Text := LocalFolder;
+      RefreshUIFromRepo(Repo); // Pass the live pointer straight through to paint the panels smoothly!
+      ShowMessage('🎉 Clone operation completed and loaded successfully!');
+    finally
+      Repo.Free;
+    end;
+  except
+    on E: Exception do
+    begin
+      FSessionToken := '';
+      StatusBar1.SimpleText := '❌ Clone failed.';
+      ShowMessage('Clone Aborted: ' + E.Message);
+    end;
+  end;
+end;
+
 
 procedure TForm1.BtnDeleteBranchClick(Sender: TObject);
 var
@@ -812,104 +864,52 @@ begin
 end;
 
 procedure TForm1.BtnSelectFolderClick(Sender: TObject);
+var
+  TargetDirectory: string;
+  Repo: TGitRepository;
 begin
   if SelectDirectoryDialog1.Execute then
   begin
-    EditRepoPath.Text := SelectDirectoryDialog1.FileName;
+    TargetDirectory := SelectDirectoryDialog1.FileName;
+    EditRepoPath.Text := TargetDirectory;
+
+    if not DirectoryExists(TargetDirectory + '/.git') then
+    begin
+      if MessageDlg('Initialize Repository', 'Initialize a brand-new repository here?', mtConfirmation, [mbYes, mbNo], 0) = mrYes then
+      begin
+        try
+          // Spawns the folder and returns a fully initialized, live object instance!
+          Repo := TGitRepository.Init(TargetDirectory);
+          try
+            RefreshUIFromRepo(Repo); // Paint the screen using our live object handles instantly!
+          finally
+            Repo.Free;
+          end;
+        except
+          on E: Exception do ShowMessage(E.Message);
+        end;
+      end;
+    end
+    else
+      BtnValidateClick(Sender);
   end;
 end;
+
 
 procedure TForm1.BtnValidateClick(Sender: TObject);
 var
   Repo: TGitRepository;
-  StatusList: TGitFileStatusArray;
-  HistoryList: TGitCommitHistoryArray;
-  I: Integer;
-  Item: TListItem;
 begin
   if EditRepoPath.Text = '' then Exit;
-
   try
     Repo := TGitRepository.Open(EditRepoPath.Text);
-
     try
-      // 1.1. Check if the workspace is locked in an unfinished transaction
-      if Repo.IsRebasing then
-      begin
-        StatusBar1.SimpleText := '⚠️ REBASE IN PROGRESS (Detached HEAD) - Resolve conflicts to continue!';
-
-        BtnRebaseContinue.Enabled := True;
-        BtnRebaseAbort.Enabled := True;
-        BtnCommit.Enabled := False;
-        BtnRebaseBranch.Enabled := False;
-      end
-      else
-      begin
-        StatusBar1.SimpleText := 'Active Branch: ' + Repo.GetActiveBranchName;
-
-        BtnRebaseContinue.Enabled := False;
-        BtnRebaseAbort.Enabled := False;
-        BtnCommit.Enabled := True;
-        BtnRebaseBranch.Enabled := True;
-      end;
-
-      // 1.2. Fetch the updated status array maps (now containing your conflicted files!)
-      StatusList := Repo.GetStatus();
-      ListViewStatus.Items.Clear;
-      for I := 0 to High(StatusList) do
-      begin
-        Item := ListViewStatus.Items.Add;
-        Item.Caption := StatusList[I].Path;
-        Item.SubItems.Add(StatusList[I].State);
-      end;
-
-      // ----------------------------------------------------
-      // 2. POPULATE COMMIT TIMELINE GRID (Left Side)
-      // ----------------------------------------------------
-      HistoryList := Repo.GetCommitHistory();
-      ListViewHistory.Items.Clear;
-      for I := 0 to High(HistoryList) do
-      begin
-        Item := ListViewHistory.Items.Add;
-        Item.Caption := HistoryList[I].Message;
-        Item.SubItems.Add(HistoryList[I].Author);
-        Item.SubItems.Add(DateTimeToStr(HistoryList[I].Timestamp));
-      end;
-
-      // --- REFRESH REMOTE TARGET OPTIONS ---
-      ComboRemotes.Items.Assign(Repo.GetRemotesList);
-      if ComboRemotes.Items.Count > 0 then
-        ComboRemotes.ItemIndex := 0;
-
-      // --- OPTIMIZED BRANCH LIST REFRESH ---
-      // Only rebuild the list array if a branch was added/deleted to prevent UI flickering
-      if ComboBranches.Items.Count <> Repo.GetLocalBranchesList.Count then
-      begin
-        ComboBranches.Items.Assign(Repo.GetLocalBranchesList);
-      end;
-
-      // Keep the visual selection perfectly synced with actual HEAD on disk
-      I := ComboBranches.Items.IndexOf(Repo.GetActiveBranchName);
-      if I >= 0 then
-      begin
-        ComboBranches.ItemIndex := I;
-      end;
-
-      // --- SYNC DISCOVERED IDENTITY TO UI FIELDS ---
-      EditUserName.Text := Repo.DefaultAuthorName;
-      EditUserEmail.Text := Repo.DefaultAuthorEmail;
-
+      RefreshUIFromRepo(Repo);
     finally
-      // This block is guaranteed to execute even if code above fails, preventing RAM leaks
       Repo.Free;
     end;
-
   except
-    // 3. THE ERROR CAPTURE: Triggered if any step inside the outer try block fails
-    on E: EGitException do
-      ShowMessage('Git Subsystem Error: ' + E.Message);
-    on E: Exception do
-      ShowMessage('Application Error: ' + E.Message);
+    on E: Exception do ShowMessage('Error opening repo: ' + E.Message);
   end;
 end;
 
@@ -1109,6 +1109,54 @@ begin
   end;
 end;
 
+procedure TForm1.RefreshUIFromRepo(Repo: TGitRepository);
+var
+  StatusList: TGitFileStatusArray;
+  HistoryList: TGitCommitHistoryArray;
+  I: Integer;
+  Item: TListItem;
+begin
+  if not Assigned(Repo) then Exit;
+
+  // 1. Check rebase states
+  if Repo.IsRebasing then
+    StatusBar1.SimpleText := '⚠️ REBASE IN PROGRESS (Detached HEAD) - Resolve conflicts to continue!'
+  else
+    StatusBar1.SimpleText := 'Active Branch: ' + Repo.GetActiveBranchName;
+
+  // 2. Populate Status Lists
+  StatusList := Repo.GetStatus();
+  ListViewStatus.Items.Clear;
+  for I := 0 to High(StatusList) do
+  begin
+    Item := ListViewStatus.Items.Add;
+    Item.Caption := StatusList[I].Path;
+    Item.SubItems.Add(StatusList[I].State);
+  end;
+
+  // 3. Populate Commit History Timeline (Handles empty/newborn repos cleanly!)
+  HistoryList := Repo.GetCommitHistory();
+  ListViewHistory.Items.Clear;
+  for I := 0 to High(HistoryList) do
+  begin
+    Item := ListViewHistory.Items.Add;
+    Item.Caption := HistoryList[I].Message;
+    Item.SubItems.Add(HistoryList[I].Author);
+    Item.SubItems.Add(DateTimeToStr(HistoryList[I].Timestamp));
+  end;
+
+  // 4. Update Dropdowns and Identity entries
+  ComboRemotes.Items.Assign(Repo.GetRemotesList);
+  if ComboRemotes.Items.Count > 0 then ComboRemotes.ItemIndex := 0;
+
+  ComboBranches.Items.Assign(Repo.GetLocalBranchesList);
+  I := ComboBranches.Items.IndexOf(Repo.GetActiveBranchName);
+  if I >= 0 then ComboBranches.ItemIndex := I
+  else if ComboBranches.Items.Count > 0 then ComboBranches.ItemIndex := 0;
+
+  EditUserName.Text := Repo.DefaultAuthorName;
+  EditUserEmail.Text := Repo.DefaultAuthorEmail;
+end;
 
 end.
 
