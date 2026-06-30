@@ -36,7 +36,7 @@ To get started, import it in Lazarus and run it.
 
 - [x] Basic repository and workspace management
 - [x] Basic local and remote branches management
-- [ ] Commit Graph
+- [x] Commit Graph
 - [ ] UI redesign
 - [ ] Tags, submodules management
 - [ ] Advanced features

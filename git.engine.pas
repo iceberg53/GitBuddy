@@ -5,7 +5,7 @@ unit Git.Engine;
 interface
 
 uses
-  Classes, SysUtils, DateUtils, // DateUtils provides UnixToDateTime
+  Classes, SysUtils, DateUtils, LazLogger, // DateUtils provides UnixToDateTime
   libgit2; // Consumes the flat libgit2-delphi API layer
 
 type
@@ -27,6 +27,23 @@ type
     LogOutput: TStrings;
   end;
   PUnifiedNetworkPayload = ^TUnifiedNetworkPayload;
+
+  type
+    // Holds a single point on our visual timeline graph
+  TGitGraphNode = record
+    CommitId: string;    // The unique SHA-1 hash of this commit
+    Message: string;     // The summary title text
+    Author: string;      // Author identity
+    Timestamp: TDateTime;// Timestamp
+    ParentIds: array of string; // Dynamic array holding all parent SHAs
+    GraphLane: Integer;           // The column index of the node circle dot
+    ParentLanes: array of Integer; // The destination column lanes this row must route lines toward
+    ActiveLanes: array of string;  // after parent assignment — tells drawing what continues BELOW -- Snapshot array of all branch SHAs traversing through this row cell
+    IncomingLanes: array of string;// before parent assignment — tells drawing what arrives FROM ABOVE
+  end;
+
+  TGitGraphArray = array of TGitGraphNode;
+
 
 
   { Data record to simplify commit tracking details for the UI }
@@ -68,6 +85,7 @@ type
     function GetRemotesList: TStringList;
     function GetLocalBranchesList: TStringList;
     function IsRebasing: Boolean;
+    function GetCommitGraph: TGitGraphArray;
     procedure Push(const RemoteName, BranchName: string);
     procedure Pull(const RemoteName: string; LogOutput: TStrings);
     procedure RebaseContinue;
@@ -548,7 +566,7 @@ begin
     // 4. CLEAN UP THE MERGE STATE: If this was a merge commit, wipe out the temporary MERGE_HEAD file system trackers
     if (ParentCount = 2) then
     begin
-      git_repository_state_cleanup(FHandle); // 👈 Removes MERGE_HEAD and puts repo back to normal clean state!
+      git_repository_state_cleanup(FHandle); // Removes MERGE_HEAD and puts repo back to normal clean state!
     end;
 
   finally
@@ -710,7 +728,7 @@ var
 begin
   Result := TStringList.Create;
 
-  // 👈 THE NATIVE Pascal FIX: Directly assign default values.
+  // THE NATIVE Pascal FIX: Directly assign default values.
   // This satisfies the strict compiler tracker natively, erasing the Hint!
   RemoteArr.strings := nil;
   RemoteArr.count := 0;
@@ -739,7 +757,7 @@ var
   FetchOpts: git_fetch_options;
   LocalRemoteName: AnsiString;
   ReflogMsg: AnsiString;
-  NetworkPackage: TUnifiedNetworkPayload; // 👈 OUR COMBINED DATA CONSTRUCTOR PASSENGER
+  NetworkPackage: TUnifiedNetworkPayload; // OUR COMBINED DATA CONSTRUCTOR PASSENGER
 begin
   RemoteHandle := nil;
   LocalRemoteName := AnsiString(RemoteName);
@@ -763,7 +781,7 @@ begin
     // 4. Link your dynamic scrolling text renderer callback
     FetchOpts.callbacks.transfer_progress := @InternalTransferProgressCallback;
 
-    // 5. 👈 THE MASTER INTEGRATION LINK: Pass the single address of our combined package structure!
+    // 5. THE MASTER INTEGRATION LINK: Pass the single address of our combined package structure!
     // Both callbacks will now read from their respective parts of this stable shared memory cell.
     FetchOpts.callbacks.payload := @NetworkPackage;
 
@@ -1222,7 +1240,7 @@ begin
 
     ReflogMsg := AnsiString('update tips from push operation');
 
-    // 2. 👈 THE CLEAN FIX: Uses the exact, official constant you discovered in your headers!
+    // 2. THE CLEAN FIX: Uses the exact, official constant you discovered in your headers!
     // This satisfies the git_remote_autotag_option_t enum expectation perfectly.
     CheckError(git_remote_update_tips(
       RemoteHandle,
@@ -1379,6 +1397,158 @@ begin
     end;
   end;
 end;
+
+function TGitRepository.GetCommitGraph: TGitGraphArray;
+var
+  Walker: Pgit_revwalk;
+  CommitOid: git_oid;
+  CommitObj: Pgit_commit;
+  ParentCommit: Pgit_commit;
+  AuthorSig: Pgit_signature;
+  NodeCount, PCount, J, I, ExistingLane: Integer;
+  Buf: array[0..40] of Char;
+  LanesTracker: TStringList; // Acts as our live active track layout manager
+begin
+  SetLength(Result, 0);
+  Walker := nil;
+  NodeCount := 0;
+  LanesTracker := TStringList.Create;
+
+  if git_repository_head_unborn(FHandle) = 1 then
+  begin
+    LanesTracker.Free;
+    Exit;
+  end;
+
+  try
+    if git_revwalk_new(@Walker, FHandle) = 0 then
+    begin
+      git_revwalk_push_head(Walker);
+      git_revwalk_sorting(Walker, GIT_SORT_TOPOLOGICAL);
+
+      while git_revwalk_next(@CommitOid, Walker) = 0 do
+      begin
+        CommitObj := nil;
+        if git_commit_lookup(@CommitObj, FHandle, @CommitOid) = 0 then
+        begin
+          try
+            Inc(NodeCount);
+            SetLength(Result, NodeCount);
+
+            git_oid_fmt(Buf, @CommitOid);
+            Buf[40] := #0;
+            Result[NodeCount - 1].CommitId := StrPas(Buf);
+            Result[NodeCount - 1].Message := string(git_commit_message(CommitObj));
+
+            AuthorSig := git_commit_author(CommitObj);
+            if Assigned(AuthorSig) then
+            begin
+              Result[NodeCount - 1].Author := string(AuthorSig^.name_);
+              Result[NodeCount - 1].Timestamp := UnixToDateTime(AuthorSig^.when.time);
+            end;
+
+            PCount := git_commit_parentcount(CommitObj);
+            SetLength(Result[NodeCount - 1].ParentIds, PCount);
+
+            for J := 0 to PCount - 1 do
+            begin
+              ParentCommit := nil;
+              if git_commit_parent(@ParentCommit, CommitObj, J) = 0 then
+              begin
+                try
+                  git_oid_fmt(Buf, git_commit_id(ParentCommit));
+                  Buf[40] := #0;
+                  Result[NodeCount - 1].ParentIds[J] := StrPas(Buf);
+                finally
+                  git_commit_free(ParentCommit);
+                end;
+              end;
+            end;
+
+            // SNAPSHOT BEFORE PARENT ASSIGNMENT — captures what lanes arrive from above
+            SetLength(Result[NodeCount - 1].IncomingLanes, LanesTracker.Count);
+            for I := 0 to LanesTracker.Count - 1 do
+              Result[NodeCount - 1].IncomingLanes[I] := LanesTracker[I];
+
+            // A. ALLOCATE NODE GRAPH LANE POSITION
+            ExistingLane := LanesTracker.IndexOf(Result[NodeCount - 1].CommitId);
+            if ExistingLane >= 0 then
+            begin
+              Result[NodeCount - 1].GraphLane := ExistingLane;
+              LanesTracker[ExistingLane] := ''; // Free slot
+            end
+            else
+            begin
+              ExistingLane := 0;
+              while (ExistingLane < LanesTracker.Count) and (LanesTracker[ExistingLane] <> '') do
+                Inc(ExistingLane);
+
+              Result[NodeCount - 1].GraphLane := ExistingLane;
+              if ExistingLane = LanesTracker.Count then
+                LanesTracker.Add('')
+              else
+                LanesTracker[ExistingLane] := '';
+            end;
+
+            // B. POPULATE PARENT DESTINATION TRACK LANES
+            SetLength(Result[NodeCount - 1].ParentLanes, PCount);
+            for J := 0 to PCount - 1 do
+            begin
+              // Check if this parent is already reserved in the tracker
+              I := LanesTracker.IndexOf(Result[NodeCount - 1].ParentIds[J]);
+              if I >= 0 then
+              begin
+                // Already claimed by another child — just point to it, don't double-write
+                Result[NodeCount - 1].ParentLanes[J] := I;
+                // If this was our own lane reservation, free it since the parent
+                // already has a slot — don't leave a duplicate
+                if J = 0 then
+                  LanesTracker[ExistingLane] := '';
+              end
+              else
+              begin
+                if J = 0 then
+                begin
+                  // Reuse our own lane for first parent (normal continuation)
+                  LanesTracker[ExistingLane] := Result[NodeCount - 1].ParentIds[J];
+                  Result[NodeCount - 1].ParentLanes[J] := ExistingLane;
+                end
+                else
+                begin
+                  // Allocate a new empty slot for additional merge parents
+                  I := 0;
+                  while (I < LanesTracker.Count) and (LanesTracker[I] <> '') do
+                    Inc(I);
+                  if I = LanesTracker.Count then
+                    LanesTracker.Add(Result[NodeCount - 1].ParentIds[J])
+                  else
+                    LanesTracker[I] := Result[NodeCount - 1].ParentIds[J];
+                  Result[NodeCount - 1].ParentLanes[J] := I;
+                end;
+              end;
+            end;
+
+            // C. LOCK IN OPEN TRACK SNAPSHOT FOR THIS CELL ROW
+            // SNAPSHOT AFTER PARENT ASSIGNMENT — captures what lanes continue below
+            SetLength(Result[NodeCount - 1].ActiveLanes, LanesTracker.Count);
+            for I := 0 to LanesTracker.Count - 1 do
+              Result[NodeCount - 1].ActiveLanes[I] := LanesTracker[I];
+
+            {DebugLogger.LogName:='debug1.log';
+            for I := 0 to LanesTracker.Count - 1 do
+              DebugLn('Row ', AnsiString(IntToStr(NodeCount-1)), ' Lane ', AnsiString(IntToStr(I)), ' = "', LanesTracker[I], '"');}
+          finally
+            git_commit_free(CommitObj);
+          end;
+        end;
+      end;
+      git_revwalk_free(Walker);
+    end;
+  finally
+    LanesTracker.Free;
+  end;
+end;
+
 
 end.
 

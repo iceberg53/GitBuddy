@@ -35,7 +35,7 @@ object Form1: TForm1
       Height = 38
       Top = 80
       Width = 130
-      Caption = 'Browse...'
+      Caption = 'Open / Create'
       TabOrder = 1
       OnClick = BtnSelectFolderClick
     end
@@ -44,7 +44,7 @@ object Form1: TForm1
       Height = 38
       Top = 120
       Width = 130
-      Caption = 'Open Repo'
+      Caption = 'Refresh'
       TabOrder = 2
       OnClick = BtnValidateClick
     end
@@ -311,21 +311,30 @@ object Form1: TForm1
     Align = alClient
     Columns = <    
       item
+        Caption = 'Graph'
+        Width = 80
+      end    
+      item
         Caption = 'Commit Message'
-        Width = 350
+        Width = 250
       end    
       item
         Caption = 'Author'
-        Width = 150
+        Width = 120
       end    
       item
         Caption = 'Date'
-        Width = 120
+        Width = 140
+      end    
+      item
+        Caption = 'Timeline Links / Parents'
+        Width = 150
       end>
     GridLines = True
     RowSelect = True
     TabOrder = 2
     ViewStyle = vsReport
+    OnCustomDrawItem = ListViewHistoryCustomDrawItem
   end
   object Splitter1: TSplitter
     Left = 491

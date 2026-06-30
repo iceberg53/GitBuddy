@@ -5,7 +5,7 @@ unit Main;
 interface
 
 uses
-  Classes, SysUtils, Forms, Controls, Graphics, Dialogs, StdCtrls, ComCtrls,
+  Classes, SysUtils, Forms, Controls, Graphics, Dialogs, StdCtrls, ComCtrls, LazLogger,
   ExtCtrls, Buttons, SynEdit, Git.Engine, Git.DiffParser; // Pure Pascal tracking wrapper. Zero libgit2 raw C inclusions.
 
 type
@@ -73,6 +73,8 @@ type
     procedure FormCreate(Sender: TObject);
     procedure BtnSelectFolderClick(Sender: TObject);
     procedure BtnValidateClick(Sender: TObject);
+    procedure ListViewHistoryCustomDrawItem(Sender: TCustomListView;
+      Item: TListItem; State: TCustomDrawState; var DefaultDraw: Boolean);
     procedure ListViewStatusSelectItem(Sender: TObject; Item: TListItem;
       Selected: Boolean);
     procedure SynEditDiffPaint(Sender: TObject; ACanvas: TCanvas);
@@ -80,6 +82,7 @@ type
       var Special: boolean; var FG, BG: TColor);
   private
     FSessionToken: string; // Stores the Personal Access Token in RAM for this session
+    FGraphList: TGitGraphArray;
     procedure RefreshUIFromRepo(Repo: TGitRepository);
   public
   end;
@@ -913,6 +916,238 @@ begin
   end;
 end;
 
+procedure TForm1.ListViewHistoryCustomDrawItem(Sender: TCustomListView;
+  Item: TListItem; State: TCustomDrawState; var DefaultDraw: Boolean);
+const
+  LANE_WIDTH = 14; //14;       // px between lane centers — wide enough for radius-4 circles
+  LANE_OFFSET = 10; //10;      // left margin before lane 0
+  CIRCLE_RADIUS = 4; //4;
+  PEN_WIDTH = 2; //2;
+  LANE_COLORS: array[0..4] of TColor = (
+    clBlue, $0000A5FF {Orange}, clGreen, clPurple, clTeal
+  );
+var
+  NodeIndex, LaneX, ParentLaneX, RowTopY, RowBottomY, RowMidY: Integer;
+  NodeColor, PassColor: TColor;
+  RowBounds, ClipBounds: TRect;
+  MaxLane, I, J, ColLeft: Integer;
+  CellText: string;
+  TextStyle: TTextStyle;
+  IsParentLane: Boolean;
+begin
+  DefaultDraw := False;
+  if Item.Index < 0 then Exit;
+
+  NodeIndex := Item.Index;
+  if NodeIndex > High(FGraphList) then Exit;
+
+  RowBounds  := Item.DisplayRect(drBounds);
+  RowTopY    := RowBounds.Top;
+  RowBottomY := RowBounds.Bottom;
+  RowMidY    := RowTopY + (RowBounds.Height div 2);
+
+  MaxLane := 0;
+  for I := 0 to High(FGraphList) do
+  begin
+    if FGraphList[I].GraphLane > MaxLane then
+      MaxLane := FGraphList[I].GraphLane;
+    for J := 0 to High(FGraphList[I].ActiveLanes) do
+      if FGraphList[I].ActiveLanes[J] <> '' then
+        if J > MaxLane then MaxLane := J;
+  end;
+  ListViewHistory.Columns[0].Width := 10 + (MaxLane + 1) * 14 + 14;
+
+
+  // ── 1. BACKGROUND ──────────────────────────────────────────────────────────
+  if cdsSelected in State then
+  begin
+    Sender.Canvas.Brush.Color := clHighlight;
+    Sender.Canvas.Font.Color  := clHighlightText;
+  end
+  else
+  begin
+    Sender.Canvas.Brush.Color := Sender.Color;
+    Sender.Canvas.Font.Color  := Sender.Font.Color;
+  end;
+  Sender.Canvas.FillRect(RowBounds);
+
+  // ── 2. PASSTHROUGH LINES ───────────────────────────────────────────────────
+  // Draw full-height verticals for lanes that are simply passing through.
+  // A lane passes through if it is active (non-empty in ActiveLanes) AND
+  // is neither this node's lane nor a parent-destination lane.
+  for I := 0 to High(FGraphList[NodeIndex].ActiveLanes) do
+  begin
+    // Only draw passthrough for lanes that are neither this node's lane
+    // nor a parent destination (those are handled by steps 3 and 4)
+    if I = FGraphList[NodeIndex].GraphLane then Continue;
+
+    IsParentLane := False;
+    for J := 0 to High(FGraphList[NodeIndex].ParentLanes) do
+      if FGraphList[NodeIndex].ParentLanes[J] = I then
+      begin
+        IsParentLane := True;
+        Break;
+      end;
+    if IsParentLane then Continue;
+
+    PassColor := LANE_COLORS[I mod Length(LANE_COLORS)];
+    LaneX := RowBounds.Left + LANE_OFFSET + I * LANE_WIDTH;
+    Sender.Canvas.Pen.Color := PassColor;
+    Sender.Canvas.Pen.Width := PEN_WIDTH;
+
+    // Top half: lane must appear in IncomingLanes (arrived from above)
+    if (I <= High(FGraphList[NodeIndex].IncomingLanes)) and
+       (FGraphList[NodeIndex].IncomingLanes[I] <> '') then
+    begin
+      Sender.Canvas.MoveTo(LaneX, RowTopY);
+      Sender.Canvas.LineTo(LaneX, RowMidY);
+    end;
+
+    // Bottom half: lane must appear in ActiveLanes (continues below)
+    if (I <= High(FGraphList[NodeIndex].ActiveLanes)) and
+       (FGraphList[NodeIndex].ActiveLanes[I] <> '') then
+    begin
+      Sender.Canvas.MoveTo(LaneX, RowMidY);
+      Sender.Canvas.LineTo(LaneX, RowBottomY);
+    end;
+  end;
+
+  // ── 3. NODE LANE VERTICAL SEGMENTS ─────────────────────────────────────────
+  NodeColor := LANE_COLORS[FGraphList[NodeIndex].GraphLane mod Length(LANE_COLORS)];
+  LaneX     := RowBounds.Left + LANE_OFFSET + FGraphList[NodeIndex].GraphLane * LANE_WIDTH;
+  Sender.Canvas.Pen.Color := NodeColor;
+  Sender.Canvas.Pen.Width := PEN_WIDTH;
+
+  // Top half: this lane must have been incoming from above
+  if (NodeIndex > 0) and
+     (FGraphList[NodeIndex].GraphLane <= High(FGraphList[NodeIndex].IncomingLanes)) and
+     (FGraphList[NodeIndex].IncomingLanes[FGraphList[NodeIndex].GraphLane] <> '') then
+  begin
+    Sender.Canvas.MoveTo(LaneX, RowTopY);
+    Sender.Canvas.LineTo(LaneX, RowMidY);
+  end;
+
+  // Bottom half: first parent continues on this same lane
+  if (Length(FGraphList[NodeIndex].ParentIds) > 0) and
+     (Length(FGraphList[NodeIndex].ParentLanes) > 0) and
+     (FGraphList[NodeIndex].ParentLanes[0] = FGraphList[NodeIndex].GraphLane) then
+  begin
+    Sender.Canvas.MoveTo(LaneX, RowMidY);
+    Sender.Canvas.LineTo(LaneX, RowBottomY);
+  end;
+
+  // ── 4. MERGE / BRANCH ELBOW LINES ──────────────────────────────────────────
+  for J := 0 to High(FGraphList[NodeIndex].ParentLanes) do
+  begin
+    ParentLaneX := RowBounds.Left + LANE_OFFSET + FGraphList[NodeIndex].ParentLanes[J] * LANE_WIDTH;
+    if ParentLaneX = LaneX then Continue;
+
+    // DEBUG — log what IncomingLanes holds for this parent lane
+    {DebugLogger.LogName := 'drawdebug.log';
+    if FGraphList[NodeIndex].ParentLanes[J] <= High(FGraphList[NodeIndex].IncomingLanes) then
+      DebugLn('Row ', AnsiString(IntToStr(NodeIndex)),
+              ' ParentLane ', AnsiString(IntToStr(FGraphList[NodeIndex].ParentLanes[J])),
+              ' IncomingLanes value = "',
+              AnsiString(FGraphList[NodeIndex].IncomingLanes[FGraphList[NodeIndex].ParentLanes[J]]),
+              '"')
+    else
+      DebugLn('Row ', AnsiString(IntToStr(NodeIndex)),
+              ' ParentLane ', AnsiString(IntToStr(FGraphList[NodeIndex].ParentLanes[J])),
+              ' is OUT OF BOUNDS for IncomingLanes (High=',
+              AnsiString(IntToStr(High(FGraphList[NodeIndex].IncomingLanes))), ')');}
+
+
+    if J = 0 then
+      Sender.Canvas.Pen.Color := NodeColor
+    else
+      Sender.Canvas.Pen.Color := LANE_COLORS[FGraphList[NodeIndex].ParentLanes[J] mod Length(LANE_COLORS)];
+    Sender.Canvas.Pen.Width := PEN_WIDTH;
+
+    // Draw the TOP half: incoming vertical from top of row down to node center.
+    // This is the segment that arrives into the merge node from the branch above.
+    // Without this, the branch lane has a gap in the merge row itself.
+    // Only draw the arriving top-half if that lane was already active above
+    // Top half of parent lane arriving into this merge node
+    if (FGraphList[NodeIndex].ParentLanes[J] <= High(FGraphList[NodeIndex].IncomingLanes)) and
+       (FGraphList[NodeIndex].IncomingLanes[FGraphList[NodeIndex].ParentLanes[J]] <> '') then
+    begin
+      Sender.Canvas.MoveTo(ParentLaneX, RowTopY);
+      Sender.Canvas.LineTo(ParentLaneX, RowBottomY - 2);
+    end;
+
+    // Draw the elbow: from node center across and down to row bottom.
+    // Bend at the lower quarter of the row for a clean diagonal-free look.
+    Sender.Canvas.MoveTo(LaneX, RowMidY);
+    Sender.Canvas.LineTo(LaneX, RowBottomY - 2);
+    Sender.Canvas.LineTo(ParentLaneX, RowBottomY - 2);
+    Sender.Canvas.LineTo(ParentLaneX, RowBottomY);
+
+  end;
+  // ── 5. COMMIT CIRCLE ───────────────────────────────────────────────────────
+  // Draw circle last so it sits on top of the lines
+  LaneX := RowBounds.Left + LANE_OFFSET + FGraphList[NodeIndex].GraphLane * LANE_WIDTH;
+  Sender.Canvas.Brush.Color := NodeColor;
+  Sender.Canvas.Pen.Color   := NodeColor;
+  Sender.Canvas.Pen.Width   := PEN_WIDTH div 2; //1;
+  Sender.Canvas.Ellipse(LaneX - CIRCLE_RADIUS, RowMidY - CIRCLE_RADIUS,
+                        LaneX + CIRCLE_RADIUS, RowMidY + CIRCLE_RADIUS);
+
+  if cdsSelected in State then
+  begin
+    Sender.Canvas.Brush.Style := bsClear;
+    Sender.Canvas.Pen.Color   := clWhite;
+    Sender.Canvas.Ellipse(LaneX - CIRCLE_RADIUS - 2, RowMidY - CIRCLE_RADIUS - 2,
+                          LaneX + CIRCLE_RADIUS + 2, RowMidY + CIRCLE_RADIUS + 2);
+  end;
+
+  // ── 6. TEXT COLUMNS ────────────────────────────────────────────────────────
+  TextStyle            := Sender.Canvas.TextStyle;
+  TextStyle.SingleLine := True;
+  TextStyle.EndEllipsis := True;
+  TextStyle.Clipping   := True;
+  TextStyle.WordBreak  := False;
+  TextStyle.Layout     := tlCenter;
+
+  if cdsSelected in State then
+    Sender.Canvas.Font.Color := clHighlightText
+  else
+    Sender.Canvas.Font.Color := Sender.Font.Color;
+
+  ColLeft := RowBounds.Left + TListView(Sender).Columns[0].Width;
+
+  for I := 1 to 4 do
+  begin
+    if I >= TListView(Sender).Columns.Count then Break;
+
+    ClipBounds.Left   := ColLeft + 6;
+    ClipBounds.Top    := RowTopY;
+    ClipBounds.Right  := ColLeft + TListView(Sender).Columns[I].Width - 6;
+    ClipBounds.Bottom := RowBottomY;
+
+    case I of
+      1: CellText := FGraphList[NodeIndex].Message;
+      2: CellText := FGraphList[NodeIndex].Author;
+      3: CellText := DateTimeToStr(FGraphList[NodeIndex].Timestamp);
+      4: if Length(FGraphList[NodeIndex].ParentIds) = 0 then
+           CellText := '[Root Commit]'
+         else if Length(FGraphList[NodeIndex].ParentIds) = 1 then
+           CellText := 'Parent: ' + Copy(FGraphList[NodeIndex].ParentIds[0], 1, 7)
+         else
+           CellText := 'Merge: ' + Copy(FGraphList[NodeIndex].ParentIds[0], 1, 7)
+                     + ' + ' + Copy(FGraphList[NodeIndex].ParentIds[1], 1, 7);
+    end;
+
+    Sender.Canvas.TextRect(ClipBounds, ClipBounds.Left, RowTopY, CellText, TextStyle);
+    Inc(ColLeft, TListView(Sender).Columns[I].Width);
+  end;
+
+  // ── 7. RESET CANVAS STATE ──────────────────────────────────────────────────
+  Sender.Canvas.Brush.Style := bsSolid;
+  Sender.Canvas.Pen.Width   := 1;
+  Sender.Canvas.Pen.Color   := clBlack;
+  Sender.Canvas.Brush.Color := Sender.Color;
+end;
+
 procedure TForm1.ListViewStatusSelectItem(Sender: TObject; Item: TListItem; Selected: Boolean);
 var
   StateStr: string;
@@ -1112,7 +1347,6 @@ end;
 procedure TForm1.RefreshUIFromRepo(Repo: TGitRepository);
 var
   StatusList: TGitFileStatusArray;
-  HistoryList: TGitCommitHistoryArray;
   I: Integer;
   Item: TListItem;
 begin
@@ -1134,16 +1368,36 @@ begin
     Item.SubItems.Add(StatusList[I].State);
   end;
 
-  // 3. Populate Commit History Timeline (Handles empty/newborn repos cleanly!)
-  HistoryList := Repo.GetCommitHistory();
+    // 3. POPULATE COMMIT TIMELINE GRAPH DATA
+  // We substitute our old history walker with our new unified Graph Array!
+  // Mine the repo graph and map the data payload straight into your persistent form field array!
+    // --- POPULATE COMMIT HISTORY GRAPH DATA ---
+  FGraphList := Repo.GetCommitGraph();
+
   ListViewHistory.Items.Clear;
-  for I := 0 to High(HistoryList) do
+  for I := 0 to High(FGraphList) do
   begin
     Item := ListViewHistory.Items.Add;
-    Item.Caption := HistoryList[I].Message;
-    Item.SubItems.Add(HistoryList[I].Author);
-    Item.SubItems.Add(DateTimeToStr(HistoryList[I].Timestamp));
+
+    // Column 0 is our blank canvas space!
+    Item.Caption := '';
+
+    // 👈 FIXED: Extract the data for each column separately into the SubItems array!
+    Item.SubItems.Add(FGraphList[I].Message);   // Column 1
+    Item.SubItems.Add(FGraphList[I].Author);    // Column 2
+    Item.SubItems.Add(DateTimeToStr(FGraphList[I].Timestamp)); // Column 3
+
+    // Debug info row mapping
+    if Length(FGraphList[I].ParentIds) = 0 then
+      Item.SubItems.Add('[Root Commit]')
+    else if Length(FGraphList[I].ParentIds) = 1 then
+      Item.SubItems.Add('Parent: ' + Copy(FGraphList[I].ParentIds[0], 1, 7))
+    else if Length(FGraphList[I].ParentIds) >= 2 then
+      Item.SubItems.Add('Merge: ' + Copy(FGraphList[I].ParentIds[0], 1, 7) + ' + ' + Copy(FGraphList[I].ParentIds[1], 1, 7))
+    else
+      Item.SubItems.Add('[Orphan State]');
   end;
+
 
   // 4. Update Dropdowns and Identity entries
   ComboRemotes.Items.Assign(Repo.GetRemotesList);
